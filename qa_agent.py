@@ -1,38 +1,19 @@
 #!/usr/bin/env python3
 """
-qa_agent.py — CLI Q&A agent over Gutermann's product_overview.md
+qa_agent.py — CLI Q&A agent for Gutermann's product catalogue (product_overview.md)
 
-Pipeline:
-  1. Ingestion (runs once at startup)
-     - parse markdown
-     - chunk it by product (### headings), carrying along the shared
-       category intro text (## section) each product lives under
-     - embed each chunk, cache the vectors to disk (keyed by a hash of
-       the source file so edits invalidate the cache automatically)
-  2. Retrieval (per query)
-     - embed the query
-     - hybrid score = cosine(embedding) + keyword-overlap bonus
-       (pure cosine under-weights exact spec terms like "plastic" /
-       "long distances" when several chunks are topically similar —
-       see README "Discussion" section, query 4)
-  3. Generation
-     - retrieved chunks -> strict "answer only from context" prompt
-     - low-confidence retrieval short-circuits to an explicit
-       "not enough info" answer instead of letting the LLM guess
-  4. CLI loop — type a question, "exit"/"quit" to stop
+What it does:
+1. Reads the markdown and splits it into one chunk per product
+2. Turns each chunk into a vector (TF-IDF by default) and caches it to disk
+3. For each question: finds the closest chunks, then asks the LLM to
+   answer using only that text (says "not enough info" if it can't)
 
-Usage:
-    python qa_agent.py                       # uses product_overview.md
-    python qa_agent.py --file other.md
-    python qa_agent.py --rebuild-index        # force re-embedding
+Run:
+    python qa_agent.py
+    python qa_agent.py --rebuild-index   # re-embed if the markdown changed
     python qa_agent.py --top-k 5
-    python qa_agent.py --no-sources           # hide the [Source: ...] line
 
-Configure the LLM via environment variables (see .env.example):
-    LLM_PROVIDER = anthropic | openai | ollama   (auto-detected if unset)
-    ANTHROPIC_API_KEY / OPENAI_API_KEY as needed
-    EMBEDDING_BACKEND = tfidf (default, zero setup) | sbert (better recall,
-        needs `pip install sentence-transformers` + a one-time model download)
+LLM setup goes in .env — see .env.example (Anthropic / OpenAI / Groq / Ollama).
 """
 
 import argparse
@@ -57,11 +38,7 @@ CONFIDENCE_FLOOR = {
 
 NOT_ENOUGH_INFO = "The document doesn't contain enough information to answer that."
 
-
-# --------------------------------------------------------------------------
 # 1. Ingestion: parsing + chunking
-# --------------------------------------------------------------------------
-
 @dataclass
 class Chunk:
     id: int
@@ -95,21 +72,19 @@ def _clean_line(line: str) -> str:
 
 def parse_markdown_to_chunks(md_text: str) -> List[Chunk]:
     """
-    Splits the document into one chunk per product (### heading).
+    Split the markdown into one chunk per product (### heading).
 
-    Each chunk's text is the *category intro* (any prose/bullets that sit
-    directly under a ## heading, before the first ###) followed by the
-    product's own bullets. This matters for e.g. "## Permanent Leak
-    Detection Monitoring", where shared facts like "no drilling required"
-    and "NB-IoT" live in the intro, not under ZONESCAN AI / ZONESCAN HYDRO
-    individually — a query about "no drilling" would miss those products
-    entirely if we dropped the shared intro.
+    Each chunk = the category's shared intro text (anything under a ##
+    heading before the first ###) + that product's own bullets. Needed
+    because some facts, like "no drilling required" under Permanent Leak
+    Detection Monitoring, only appear once in the intro — not repeated
+    under each product below it. Drop the intro and a query about "no
+    drilling" would miss ZONESCAN AI / ZONESCAN HYDRO entirely.
 
-    A handful of section labels in the source aren't real markdown
-    headings (e.g. "Acoustic Leak Detection Microphones" is a bare line,
-    not "## ..."). We detect these heuristically: a short, non-bullet,
-    unpunctuated line that is immediately followed (skipping blanks/
-    images/comments) by a "### " line is treated as a category header.
+    A couple of section labels in the source aren't real ## headings
+    ("Acoustic Leak Detection Microphones" is just a bare line). We
+    catch these by a simple rule: a short line with no bullet/punctuation
+    that's immediately followed by a ### line counts as a heading too.
     """
     raw_lines = md_text.split("\n")
 
@@ -192,11 +167,7 @@ def parse_markdown_to_chunks(md_text: str) -> List[Chunk]:
     flush_product()
     return chunks
 
-
-# --------------------------------------------------------------------------
 # 2. Embeddings
-# --------------------------------------------------------------------------
-
 class Embedder:
     """Pluggable embedding backend: 'tfidf' (default, no download, works
     offline) or 'sbert' (sentence-transformers, better semantic recall).
@@ -232,11 +203,7 @@ def _l2_normalize(mat: np.ndarray) -> np.ndarray:
     norms[norms == 0] = 1.0
     return mat / norms
 
-
-# --------------------------------------------------------------------------
 # Vector store + hybrid retrieval
-# --------------------------------------------------------------------------
-
 class VectorStore:
     def __init__(self, chunks: List[Chunk], vectors: np.ndarray, embedder: Embedder):
         self.chunks = chunks
@@ -268,9 +235,7 @@ class VectorStore:
         return [(self.chunks[i], float(combined[i])) for i in order]
 
 
-# --------------------------------------------------------------------------
 # Ingestion cache (persist embeddings to a local file)
-# --------------------------------------------------------------------------
 
 def build_or_load_index(md_path: Path, backend: str, rebuild: bool) -> VectorStore:
     md_text = md_path.read_text(encoding="utf-8")
@@ -300,11 +265,7 @@ def build_or_load_index(md_path: Path, backend: str, rebuild: bool) -> VectorSto
 
     return VectorStore(chunks, vectors, embedder)
 
-
-# --------------------------------------------------------------------------
 # 3. Generation
-# --------------------------------------------------------------------------
-
 SYSTEM_PROMPT = """You are a product-knowledge assistant for Gutermann's water leak \
 detection equipment catalogue.
 
@@ -398,10 +359,7 @@ def answer_query(store: VectorStore, query: str, top_k: int, provider: str,
         answer = f"{answer}\n[Source: {sources}]"
     return answer
 
-
-# --------------------------------------------------------------------------
 # 4. CLI loop
-# --------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="CLI Q&A agent over product_overview.md")
